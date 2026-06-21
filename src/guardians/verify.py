@@ -23,8 +23,6 @@ from .safe_eval import safe_eval
 from .tools import ToolRegistry, ToolSpec
 from .workflow import Workflow, WorkflowStep, SymRef
 
-MAX_LOOP_ITERATIONS = 3
-
 
 # --- Abstract values ---
 
@@ -32,20 +30,155 @@ MAX_LOOP_ITERATIONS = 3
 class AbstractValue:
     """A symbolic value carrying taint labels during verification.
 
+    Every component is set-valued and ordered by inclusion, so the whole
+    value lives in a finite powerset lattice (a genuine lattice, not merely
+    a join-semilattice):
+
     Attributes:
-        labels: taint label strings on this value.
+        labels: taint label strings on this value.  May-taint: joined by
+            union.
         sanitized_for: names of taint rules this value was sanitized for.
-        source_tool: the tool that directly produced this value.
+            Must-hold: joined by intersection (a guarantee survives only
+            if it held on every incoming path).
+        source_tools: the set of tools that may have *directly* produced
+            this value.  Joined by union; the empty set is bottom (no known
+            direct producer).  Modelling this as a set rather than a single
+            string with a sentinel avoids a magic value that could collide
+            with a real tool name, and makes it a proper lattice.
         provenance: all tools whose outputs contributed to this value,
-            transitively through data flow.  Used by taint checking to
-            verify that a taint rule's declared source_tool actually
-            appears in the data's lineage.
+            transitively through data flow.  May-contribute: joined by
+            union.  Used by taint checking to verify that a taint rule's
+            declared source_tool actually appears in the data's lineage.
     """
 
     labels: set[str] = field(default_factory=set)
     sanitized_for: set[str] = field(default_factory=set)
-    source_tool: str = "unknown"
+    source_tools: set[str] = field(default_factory=set)
     provenance: set[str] = field(default_factory=set)
+
+
+# ===================================================================
+# Abstract lattice: values, states, joins, and orderings
+# ===================================================================
+#
+# The verification domain is a finite lattice.  An AbstractState captures
+# every component that can affect future verification: the variable
+# environment and the possible-state set of every security automaton.
+# (Diagnostics are not part of the semantic state — they do not influence
+# later transfer — but fixpoint iteration must not duplicate them.)
+#
+# Orderings (x <= y means "x is more precise / less-or-equal-information"):
+#   - labels, provenance     grow by subset inclusion;
+#   - source_tools           grow by subset inclusion (set of possible
+#                             direct producers; bottom is the empty set);
+#   - automaton state sets    grow by subset inclusion;
+#   - sanitized_for           shrinks (reverse subset inclusion: losing a
+#                             sanitization guarantee moves *up*);
+#   - a missing binding is treated as TOP (unusable): joining a value with
+#     "absent" yields "absent", so a binding present on only one path does
+#     not escape the join.
+#
+# join is the least upper bound; it is idempotent, commutative, and
+# associative (verified by tests).
+
+
+def join_value(a: AbstractValue, b: AbstractValue) -> AbstractValue:
+    """Least upper bound of two abstract values.
+
+    labels/provenance/source_tools union (may-information), sanitized_for
+    intersect (must-information).
+    """
+    return AbstractValue(
+        labels=a.labels | b.labels,
+        sanitized_for=a.sanitized_for & b.sanitized_for,
+        source_tools=a.source_tools | b.source_tools,
+        provenance=a.provenance | b.provenance,
+    )
+
+
+def value_leq(a: AbstractValue, b: AbstractValue) -> bool:
+    """Whether ``a`` is below-or-equal ``b`` in the value lattice."""
+    return (
+        a.labels <= b.labels
+        and a.provenance <= b.provenance
+        and a.source_tools <= b.source_tools
+        and a.sanitized_for >= b.sanitized_for
+    )
+
+
+def value_eq(a: AbstractValue, b: AbstractValue) -> bool:
+    """Complete structural equality of two abstract values."""
+    return (
+        a.labels == b.labels
+        and a.sanitized_for == b.sanitized_for
+        and a.source_tools == b.source_tools
+        and a.provenance == b.provenance
+    )
+
+
+@dataclass
+class AbstractState:
+    """The complete semantic abstract state threaded through verification.
+
+    Holds every mutable component that affects later transfer:
+    the variable environment and each automaton's possible-state set.
+    """
+
+    env: dict[str, AbstractValue] = field(default_factory=dict)
+    automata: dict[str, set[str]] = field(default_factory=dict)
+
+    def copy(self) -> "AbstractState":
+        return AbstractState(env=_copy_env(self.env), automata=_copy_auto(self.automata))
+
+
+def join_state(a: AbstractState, b: AbstractState) -> AbstractState:
+    """Least upper bound of two abstract states.
+
+    A binding present in only one state is dropped (absent == TOP), so it
+    does not escape the join.  Automaton possible-state sets union.
+    """
+    env = {
+        k: join_value(a.env[k], b.env[k])
+        for k in (a.env.keys() & b.env.keys())
+    }
+    automata = {
+        name: a.automata.get(name, set()) | b.automata.get(name, set())
+        for name in (a.automata.keys() | b.automata.keys())
+    }
+    return AbstractState(env=env, automata=automata)
+
+
+def state_leq(a: AbstractState, b: AbstractState) -> bool:
+    """Whether ``a`` is below-or-equal ``b`` in the state lattice.
+
+    A missing binding is TOP, so ``a <= b`` requires every binding present
+    in ``b`` to also be present in ``a`` (and pointwise below it), while
+    bindings only in ``a`` are permitted (they sit below TOP).
+    """
+    if not (b.env.keys() <= a.env.keys()):
+        return False
+    for k in b.env:
+        if not value_leq(a.env[k], b.env[k]):
+            return False
+    for name in a.automata.keys() | b.automata.keys():
+        if not (a.automata.get(name, set()) <= b.automata.get(name, set())):
+            return False
+    return True
+
+
+def state_eq(a: AbstractState, b: AbstractState) -> bool:
+    """Complete structural-equality convergence predicate for states."""
+    if a.env.keys() != b.env.keys():
+        return False
+    for k in a.env:
+        if not value_eq(a.env[k], b.env[k]):
+            return False
+    if a.automata.keys() != b.automata.keys():
+        return False
+    for name in a.automata:
+        if a.automata[name] != b.automata[name]:
+            return False
+    return True
 
 
 # --- Public API ---
@@ -66,7 +199,7 @@ def verify(
 
     # Pass 2: abstract execution with policy checking
     env: dict[str, AbstractValue] = {
-        name: AbstractValue(source_tool="input", provenance={"input"})
+        name: AbstractValue(source_tools={"input"}, provenance={"input"})
         for name in workflow.input_variables
     }
     automaton_states: dict[str, set[str]] = {
@@ -74,12 +207,43 @@ def verify(
     }
     _verify_steps(workflow.steps, policy, registry, env, automaton_states, result)
 
+    # Fixpoint iteration revisits the same source steps, so deduplicate
+    # diagnostics that differ only by that revisiting.  Ordering is
+    # preserved deterministically (first occurrence wins).
+    _dedup_diagnostics(result)
+
     # Strict mode: promote warnings to violations
     if strict:
         for w in result.warnings:
             result.add(Violation(category="unparseable", message=w, step_label=""))
 
     return result
+
+
+def _dedup_diagnostics(result: VerificationResult) -> None:
+    """Drop duplicate violations/warnings, preserving first-seen order.
+
+    Violations are keyed by (category, rule_name, step_label, message);
+    warnings by their complete message.  Two diagnostics with identical
+    keys are indistinguishable, so collapsing them is sound and prevents
+    loop fixpoint revisiting from inflating counts.
+    """
+    seen_v: set[tuple[str, str, str, str]] = set()
+    unique_v: list[Violation] = []
+    for v in result.violations:
+        key = (v.category, v.rule_name, v.step_label, v.message)
+        if key not in seen_v:
+            seen_v.add(key)
+            unique_v.append(v)
+    result.violations = unique_v
+
+    seen_w: set[str] = set()
+    unique_w: list[str] = []
+    for w in result.warnings:
+        if w not in seen_w:
+            seen_w.add(w)
+            unique_w.append(w)
+    result.warnings = unique_w
 
 
 # ===================================================================
@@ -247,7 +411,7 @@ def _verify_tool_call(
     abstract_result = AbstractValue(
         labels=spec_labels | input_labels,
         sanitized_for=set(),
-        source_tool=tc.tool_name,
+        source_tools={tc.tool_name},
         provenance={tc.tool_name} | input_provenance,
     )
 
@@ -289,39 +453,20 @@ def _verify_conditional(
     c = step.conditional
     assert c is not None
 
-    # Always explore both branches (intentionally conservative).
-    saved_env = _copy_env(env)
-    saved_auto = _copy_auto(automaton_states)
+    # Always explore both branches (intentionally conservative).  Each
+    # branch runs on a fresh copy of the entry state; the post-state is the
+    # lattice join.  Because join drops one-branch-only bindings, a binding
+    # created in only one branch does not escape the conditional.
+    entry = AbstractState(env=_copy_env(env), automata=_copy_auto(automaton_states))
 
-    _verify_steps(c.then_steps, policy, registry, env, automaton_states, result)
-    then_env = _copy_env(env)
-    then_auto = _copy_auto(automaton_states)
+    then_state = entry.copy()
+    _verify_steps(c.then_steps, policy, registry, then_state.env, then_state.automata, result)
 
-    env.clear()
-    env.update(saved_env)
-    automaton_states.clear()
-    automaton_states.update(saved_auto)
-    _verify_steps(c.else_steps, policy, registry, env, automaton_states, result)
+    else_state = entry.copy()
+    _verify_steps(c.else_steps, policy, registry, else_state.env, else_state.automata, result)
 
-    # Join env: merge values present in both branches, drop one-branch-only
-    joined: dict[str, AbstractValue] = {}
-    all_keys = set(then_env.keys()) | set(env.keys())
-    for k in all_keys:
-        then_val = then_env.get(k)
-        else_val = env.get(k)
-        if then_val is not None and else_val is not None:
-            joined[k] = AbstractValue(
-                labels=then_val.labels | else_val.labels,
-                sanitized_for=then_val.sanitized_for & else_val.sanitized_for,
-                source_tool=then_val.source_tool,
-                provenance=then_val.provenance | else_val.provenance,
-            )
-
-    env.clear()
-    env.update(joined)
-
-    for name in automaton_states:
-        automaton_states[name] = automaton_states[name] | then_auto.get(name, set())
+    joined = join_state(then_state, else_state)
+    _install_state(joined, env, automaton_states)
 
 
 def _verify_loop(
@@ -332,41 +477,174 @@ def _verify_loop(
     automaton_states: dict[str, set[str]],
     result: VerificationResult,
 ) -> None:
+    """Verify a loop as the least fixpoint of ``H = entry ⊔ body(H)``.
+
+    A loop runs zero or more times, so the result must over-approximate
+    every iteration count, including zero (the collection may be empty).
+    The domain is finite, so the ascending chain terminates; if it somehow
+    does not (a bug or non-monotone transfer) we reject fail-closed.
+    """
     lp = step.loop
     assert lp is not None
 
-    collection = env.get(lp.collection_ref)
-    before_keys = set(env.keys())
+    # 1-2. Save the complete pre-loop state and its outer key set.
+    entry_state = AbstractState(env=_copy_env(env), automata=_copy_auto(automaton_states))
+    outer_keys = set(entry_state.env.keys())
 
+    # 3. Derive the loop item's abstract value from the collection *as it
+    # exists on loop entry*.  The executor iterates over a snapshot
+    # (tuple(collection)) taken on entry, so neither rebinding the
+    # collection variable nor mutating it in the body can change the items
+    # seen on later iterations.
+    collection = entry_state.env.get(lp.collection_ref)
     if isinstance(collection, AbstractValue):
-        item_val = AbstractValue(
+        item_template = AbstractValue(
             labels=set(collection.labels),
             sanitized_for=set(collection.sanitized_for),
-            source_tool=collection.source_tool,
+            source_tools=set(collection.source_tools),
             provenance=set(collection.provenance),
         )
     else:
-        item_val = AbstractValue(source_tool="literal", provenance=set())
+        item_template = AbstractValue(source_tools={"literal"})
 
-    env[lp.item_binding] = item_val
+    # 4. head = entry_state represents the zero-iteration path.
+    head = entry_state.copy()
+    limit = _fixpoint_iteration_limit(entry_state, policy, registry, outer_keys)
 
     converged = False
-    for _ in range(MAX_LOOP_ITERATIONS):
-        snapshot = _copy_env(env)
-        _verify_steps(lp.body, policy, registry, env, automaton_states, result)
-        if _env_converged(snapshot, env):
-            converged = True
-            break
+    failure: str | None = None
+    next_head = head
+    for _ in range(limit):
+        # 5. Copy head, install a fresh item binding, analyze the body.
+        work = head.copy()
+        work.env[lp.item_binding] = AbstractValue(
+            labels=set(item_template.labels),
+            sanitized_for=set(item_template.sanitized_for),
+            source_tools=set(item_template.source_tools),
+            provenance=set(item_template.provenance),
+        )
+        _verify_steps(lp.body, policy, registry, work.env, work.automata, result)
 
-    if not converged:
-        result.warn(
-            f"Loop '{step.label}' did not converge after {MAX_LOOP_ITERATIONS} "
-            f"iterations; analysis may be incomplete"
+        # Remove the item binding and all body-local bindings, retaining
+        # updates to bindings that existed before the loop.
+        body_exit = AbstractState(
+            env={k: v for k, v in work.env.items() if k in outer_keys},
+            automata=work.automata,
         )
 
-    for k in list(env.keys()):
-        if k not in before_keys:
-            del env[k]
+        # The entry join is essential: it covers the empty-collection
+        # (zero-iteration) case and guarantees the chain is ascending.
+        next_head = join_state(entry_state, body_exit)
+
+        # 6. Equality => fixpoint reached.
+        if state_eq(next_head, head):
+            converged = True
+            break
+        # 7. Otherwise the chain must be monotone.
+        if not state_leq(head, next_head):
+            failure = "non_monotone"
+            break
+        head = next_head
+    else:
+        # 8. Ran out of the (finite) iteration budget without convergence.
+        failure = "diverged"
+
+    if converged:
+        final = head
+    else:
+        _add_loop_incomplete(step, lp, failure or "diverged", result)
+        # Continue only for diagnostics with a conservative over-approx;
+        # the workflow is already rejected and can never be accepted.
+        final = join_state(head, next_head) if failure == "non_monotone" else head
+
+    _install_state(final, env, automaton_states)
+
+
+def _install_state(
+    state: AbstractState,
+    env: dict[str, AbstractValue],
+    automaton_states: dict[str, set[str]],
+) -> None:
+    """Replace the caller's env and automaton state in place."""
+    env.clear()
+    env.update(_copy_env(state.env))
+    automaton_states.clear()
+    automaton_states.update(_copy_auto(state.automata))
+
+
+def _fixpoint_iteration_limit(
+    entry_state: AbstractState,
+    policy: Policy,
+    registry: ToolRegistry,
+    outer_keys: set[str],
+) -> int:
+    """A conservative bound on the height of the ascending chain.
+
+    Every fixpoint step that is not the fixpoint strictly increases the
+    state in at least one finite coordinate, so the chain cannot be longer
+    than the sum of the per-coordinate heights:
+
+      - each outer binding can gain every taint label (|L|), gain every
+        provenance atom (|P|), gain every direct-source atom (also bounded
+        by |P|), and lose every sanitization (|S|);
+      - each automaton's possible-state set can gain every state.
+
+    The bound is generous (legitimate analyses converge far below it); it
+    exists purely as a fatal emergency guard against an implementation bug
+    or a future non-finite domain.
+    """
+    labels: set[str] = set()
+    # Universe of producer atoms — covers both provenance and source_tools,
+    # which only ever hold tool names or these fixed pseudo-sources.
+    producers: set[str] = {"input", "literal", "unknown"}
+    for spec in registry.all_specs().values():
+        labels.update(spec.source_labels)
+        labels.update(spec.sink_labels)
+        producers.add(spec.name)
+    producers.update(policy.allowed_tools)
+    for v in entry_state.env.values():
+        labels.update(v.labels)
+        producers.update(v.provenance)
+        producers.update(v.source_tools)
+    sanitizers = {r.name for r in policy.taint_rules}
+
+    per_binding = len(labels) + 2 * len(producers) + len(sanitizers)
+    auto_states = sum(len(a.states) for a in policy.automata)
+    height = len(outer_keys) * per_binding + auto_states + 1
+    # Floor for tiny domains; absolute ceiling guards pathological sizes.
+    return min(max(height, 32), 1_000_000)
+
+
+def _add_loop_incomplete(
+    step: WorkflowStep,
+    lp: Any,
+    cause: str,
+    result: VerificationResult,
+) -> None:
+    """Record a fatal ``analysis_incomplete`` violation for a loop.
+
+    This rejects the workflow regardless of ``strict``: convergence of the
+    loop abstraction could not be soundly established, so the workflow can
+    never be accepted.
+    """
+    if cause == "non_monotone":
+        why = (
+            "abstract state transition was not monotone "
+            "(internal analysis failure)"
+        )
+    else:
+        why = (
+            "did not converge within the sound/emergency iteration bound"
+        )
+    result.add(Violation(
+        category="analysis_incomplete",
+        message=(
+            f"Loop '{step.label}' over @{lp.collection_ref}: {why}; "
+            f"loop convergence could not be established, workflow rejected"
+        ),
+        step_label=step.label,
+        rule_name="loop_fixpoint",
+    ))
 
 
 # ===================================================================
@@ -461,7 +739,7 @@ def _is_tainted_for_rule(
         eval_env.update(resolved)
         eval_env.update(_collect_policy_constants(policy))
         refs = expr_names(rule.condition)
-        has_symbolic = any(isinstance(eval_env.get(n), AbstractValue) for n in refs)
+        has_symbolic = any(_contains_abstract(eval_env.get(n)) for n in refs)
         if not has_symbolic:
             try:
                 if not safe_eval(rule.condition, eval_env):
@@ -659,6 +937,12 @@ def _build_glob_match(var: z3.ExprRef, pattern: z3.ExprRef) -> z3.BoolRef:
 # Automaton checking
 # ===================================================================
 
+# Abstract truth values for a guard under partial information.
+_GUARD_TRUE = "true"
+_GUARD_FALSE = "false"
+_GUARD_UNKNOWN = "unknown"
+
+
 def _check_automata(
     policy: Policy,
     tool_name: str,
@@ -667,70 +951,122 @@ def _check_automata(
     automaton_states: dict[str, set[str]],
     result: VerificationResult,
 ) -> None:
+    """Abstract successor-state transfer with ordered first-match semantics.
+
+    The runtime evaluates the matching transitions of a state in declaration
+    order and fires the first whose guard is true (otherwise it stays put).
+    Statically a guard is TRUE / FALSE / UNKNOWN.  An UNKNOWN guard *forks*:
+    the true branch takes the transition, the false branch falls through to
+    later transitions — so we must keep scanning rather than stop at the
+    first non-false guard.  Stopping early would hide a competing guarded
+    transition from the same state (e.g. an error transition declared after
+    a benign one), making the transfer unsound.
+    """
     for automaton in policy.automata:
         current_states = automaton_states[automaton.name]
         error_states = {s.name for s in automaton.states if s.is_error}
         next_states: set[str] = set()
 
         for current in current_states:
-            transitioned = False
+            fallthrough_possible = True
+            # Whether the path that *reaches* the current transition is
+            # certain (all earlier guards were definitely false).  Once an
+            # UNKNOWN guard is seen, later transitions are only conditionally
+            # reachable, so even a definitely-true guard is "could reach".
+            reached_definitely = True
+
             for trans in automaton.transitions:
                 if trans.from_state != current or trans.tool_name != tool_name:
                     continue
 
-                if trans.condition:
-                    eval_env: dict[str, Any] = {}
-                    eval_env.update(resolved)
-                    eval_env.update(automaton.constants)
-                    refs = expr_names(trans.condition)
-                    has_symbolic = any(
-                        isinstance(eval_env.get(n), AbstractValue) for n in refs
-                    )
+                truth = _abstract_guard_truth(
+                    trans.condition, resolved, automaton, tool_name,
+                    step_label, result,
+                )
 
-                    if has_symbolic:
-                        next_states.add(current)
-                        if trans.to_state in error_states:
-                            result.add(Violation(
-                                category="automaton",
-                                message=(
-                                    f"Security automaton '{automaton.name}' "
-                                    f"could reach error state '{trans.to_state}' "
-                                    f"on tool call '{tool_name}' (symbolic argument)"
-                                ),
-                                step_label=step_label,
-                                rule_name=automaton.name,
-                            ))
-                        next_states.add(trans.to_state)
-                        transitioned = True
-                        break
+                if truth == _GUARD_FALSE:
+                    continue
 
-                    try:
-                        fires = safe_eval(trans.condition, eval_env)
-                    except Exception:
-                        fires = True  # fail closed
-
-                    if not fires:
-                        continue
-
+                # TRUE or UNKNOWN: taking this transition is possible.
+                next_states.add(trans.to_state)
                 if trans.to_state in error_states:
-                    result.add(Violation(
-                        category="automaton",
-                        message=(
+                    definite = truth == _GUARD_TRUE and reached_definitely
+                    if definite:
+                        message = (
                             f"Security automaton '{automaton.name}' "
                             f"reached error state '{trans.to_state}' "
                             f"on tool call '{tool_name}'"
-                        ),
+                        )
+                    else:
+                        message = (
+                            f"Security automaton '{automaton.name}' "
+                            f"could reach error state '{trans.to_state}' "
+                            f"on tool call '{tool_name}' (symbolic argument)"
+                        )
+                    result.add(Violation(
+                        category="automaton",
+                        message=message,
                         step_label=step_label,
                         rule_name=automaton.name,
                     ))
-                next_states.add(trans.to_state)
-                transitioned = True
-                break
 
-            if not transitioned:
+                if truth == _GUARD_TRUE:
+                    # First-match: a definite guard consumes the residual
+                    # path — no later transition and no staying put.
+                    fallthrough_possible = False
+                    break
+
+                # UNKNOWN fork: the true branch took the transition above;
+                # the false branch continues to later transitions.
+                reached_definitely = False
+
+            if fallthrough_possible:
                 next_states.add(current)
 
         automaton_states[automaton.name] = next_states
+
+
+def _abstract_guard_truth(
+    condition: str | None,
+    resolved: dict[str, Any],
+    automaton: Any,
+    tool_name: str,
+    step_label: str,
+    result: VerificationResult,
+) -> str:
+    """Evaluate a transition guard to TRUE / FALSE / UNKNOWN.
+
+    A guard whose referenced arguments are (recursively) symbolic is
+    UNKNOWN.  A guard that raises during evaluation fails closed: it is a
+    hard ``analysis_incomplete`` violation and is treated conservatively as
+    UNKNOWN (so its transition is still explored).
+    """
+    if not condition:
+        return _GUARD_TRUE
+
+    eval_env: dict[str, Any] = {}
+    eval_env.update(resolved)
+    eval_env.update(automaton.constants)
+    refs = expr_names(condition)
+    if any(_contains_abstract(eval_env.get(n)) for n in refs):
+        return _GUARD_UNKNOWN
+
+    try:
+        fires = safe_eval(condition, eval_env)
+    except Exception:
+        result.add(Violation(
+            category="analysis_incomplete",
+            message=(
+                f"Security automaton '{automaton.name}' guard '{condition}' "
+                f"on tool call '{tool_name}' could not be evaluated; "
+                f"treated conservatively as unknown"
+            ),
+            step_label=step_label,
+            rule_name="automaton_guard",
+        ))
+        return _GUARD_UNKNOWN
+
+    return _GUARD_TRUE if fires else _GUARD_FALSE
 
 
 # ===================================================================
@@ -743,7 +1079,7 @@ def _resolve_abstract(arguments: dict[str, Any], env: dict[str, AbstractValue]) 
 
 def _resolve_val(val: Any, env: dict[str, AbstractValue]) -> Any:
     if isinstance(val, SymRef):
-        return env.get(val.ref, AbstractValue(source_tool="unknown"))
+        return env.get(val.ref, AbstractValue())
     if isinstance(val, dict):
         return {k: _resolve_val(v, env) for k, v in val.items()}
     if isinstance(val, list):
@@ -794,6 +1130,21 @@ def _find_all_abstracts(val: Any) -> list[AbstractValue]:
     return results
 
 
+def _contains_abstract(val: Any) -> bool:
+    """Whether a resolved value is (recursively) symbolic.
+
+    A list or dict containing an AbstractValue anywhere is symbolic, not
+    just a value that is itself an AbstractValue.
+    """
+    if isinstance(val, AbstractValue):
+        return True
+    if isinstance(val, dict):
+        return any(_contains_abstract(v) for v in val.values())
+    if isinstance(val, list):
+        return any(_contains_abstract(v) for v in val)
+    return False
+
+
 def _walk_abstracts(val: Any, results: list[AbstractValue]) -> None:
     if isinstance(val, AbstractValue):
         results.append(val)
@@ -810,7 +1161,7 @@ def _copy_env(env: dict[str, AbstractValue]) -> dict[str, AbstractValue]:
         k: AbstractValue(
             labels=set(v.labels),
             sanitized_for=set(v.sanitized_for),
-            source_tool=v.source_tool,
+            source_tools=set(v.source_tools),
             provenance=set(v.provenance),
         )
         for k, v in env.items()
@@ -819,21 +1170,6 @@ def _copy_env(env: dict[str, AbstractValue]) -> dict[str, AbstractValue]:
 
 def _copy_auto(states: dict[str, set[str]]) -> dict[str, set[str]]:
     return {k: set(v) for k, v in states.items()}
-
-
-def _env_converged(old: dict[str, AbstractValue], new: dict[str, AbstractValue]) -> bool:
-    if set(old.keys()) != set(new.keys()):
-        return False
-    for k in old:
-        o = old[k]
-        n = new.get(k)
-        if n is None:
-            return False
-        if o.labels != n.labels or o.sanitized_for != n.sanitized_for:
-            return False
-        if o.provenance != n.provenance:
-            return False
-    return True
 
 
 def _collect_policy_constants(policy: Policy) -> dict[str, Any]:

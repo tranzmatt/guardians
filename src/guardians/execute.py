@@ -137,9 +137,17 @@ class WorkflowExecutor:
                 if trans.condition:
                     eval_env = {**raw_args, **automaton.constants}
                     try:
-                        if not safe_eval(trans.condition, eval_env):
-                            continue
-                    except Exception:
+                        fires = safe_eval(trans.condition, eval_env)
+                    except Exception as e:
+                        # Fail closed: an unevaluable guard must not be
+                        # silently skipped (that could let the runtime slip
+                        # past a guarded error transition).
+                        raise SecurityViolation(
+                            f"Security automaton '{automaton.name}' guard "
+                            f"'{trans.condition}' could not be evaluated "
+                            f"on tool call '{tc.tool_name}'"
+                        ) from e
+                    if not fires:
                         continue
                 self._automaton_states[automaton.name] = trans.to_state
                 if trans.to_state in error_states:
@@ -242,7 +250,12 @@ class WorkflowExecutor:
         if isinstance(collection_val, TaintedValue):
             taint_labels = collection_val.labels
 
-        for item in collection:
+        # Snapshot the collection (a fresh tuple) before iterating, so that
+        # neither rebinding the collection variable nor mutating it in place
+        # inside the body can change which items are visited.  This matches
+        # the verifier, whose loop item is derived from the collection as it
+        # exists on entry.
+        for item in tuple(collection):
             self._tick("loop_iter")
             self._env[lp.item_binding] = TaintedValue(
                 raw=item, labels=set(taint_labels),
@@ -287,7 +300,7 @@ class WorkflowExecutor:
 
     def _request_approval(self, workflow: Workflow) -> None:
         """Show workflow summary and ask user to approve."""
-        print(f"\n--- Approval Required ---")
+        print("\n--- Approval Required ---")
         print(f"Goal: {workflow.goal}")
         for i, step in enumerate(workflow.steps, 1):
             print(f"  {i}. {step.label}")

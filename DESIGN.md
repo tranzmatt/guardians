@@ -106,6 +106,23 @@ the automaton conservatively reports "could reach error state."
 At runtime, the automaton evaluates conditions against concrete
 values and blocks transitions to error states.
 
+Both the static transfer and the runtime use **ordered first-match**
+semantics: a state's matching transitions are considered in declaration
+order, the first transition whose guard is true fires, and if none fire
+the automaton stays in the current state. Statically a guard evaluates to
+`TRUE`, `FALSE`, or `UNKNOWN` (its referenced arguments are symbolic —
+checked *recursively*, so a list or dict containing a symbolic value is
+itself symbolic). An `UNKNOWN` guard **forks**: the true branch takes the
+transition while the false branch falls through to later transitions, so
+the transfer keeps scanning rather than stopping at the first non-false
+guard. Stopping early would hide a competing guarded transition declared
+after a benign one — e.g. `q0 --go[x=="safe"]--> safe` followed by
+`q0 --go[x=="bad"]--> error` with symbolic `x` — and accept a workflow
+that errors at runtime. A guard that cannot be evaluated fails closed: a
+hard `analysis_incomplete` violation statically (treated conservatively as
+`UNKNOWN`), and a raised `SecurityViolation` at runtime rather than a
+silent skip.
+
 ### Z3 theorem proving
 
 The paper proposes using Z3 and Dafny to reason about workflow
@@ -176,12 +193,17 @@ Each `AbstractValue` carries four components, each with its own ordering
 |---|---|---|---|
 | `labels` | may-taint labels | subset | union |
 | `provenance` | possible contributing tools | subset | union |
+| `source_tools` | possible direct producers | subset | union |
 | `sanitized_for` | sanitizations that hold on **every** path | reverse subset | intersection |
-| `source_tool` | the direct producer | flat (equal, else ⊤) | equal → same, else `<multiple>` |
 
-A missing binding is treated as ⊤ (unusable), so a variable bound on only
-one path does not survive a join. Automaton state-sets grow by subset
-inclusion and join by union.
+Every component is a set ordered by inclusion, so each is a powerset
+lattice (with the empty set as bottom) — a genuine lattice, not merely a
+join-semilattice. Modelling the direct producer as a *set* (rather than a
+single string with a `<multiple>`/⊤ sentinel) is what makes it a lattice
+and avoids a sentinel that could collide with a real tool name. A missing
+binding is treated as ⊤ (unusable), so a variable bound on only one path
+does not survive a join. Automaton state-sets grow by subset inclusion and
+join by union.
 
 **Joins.** `join_value` and `join_state` compute the least upper bound
 component-wise using the table above. The joins are idempotent,
@@ -201,18 +223,18 @@ Iteration starts from `head = entry` (the zero-iteration path) and repeats
 `entry` every step is essential: it keeps the empty-collection case live
 and guarantees the chain is ascending. The loop item's abstract value is
 derived from the collection **as it exists on entry**, mirroring the
-executor, which snapshots the collection before iterating — so rebinding
-the collection inside the body cannot change later items.
+executor, which iterates over a snapshot (`tuple(collection)`) taken on
+entry — so neither rebinding the collection variable nor mutating it in
+place inside the body can change the items seen on later iterations.
 
 **Termination.** All universes are finite: taint labels and sanitizer
-names come from the policy, provenance from the finite tool set plus fixed
-pseudo-sources, automaton states from the automaton, the loop-head
-variable set from the program, and `source_tool` lives in a height-2 flat
-lattice. Every non-fixpoint step strictly increases the state in at least
-one of these finite coordinates, so the ascending chain has bounded
-length. A conservative height bound (summed from the domain sizes) is
-computed as an emergency guard against an implementation bug or a future
-non-finite domain.
+names come from the policy, provenance and direct sources from the finite
+tool set plus fixed pseudo-sources, automaton states from the automaton,
+and the loop-head variable set from the program. Every non-fixpoint step
+strictly increases the state in at least one of these finite coordinates,
+so the ascending chain has bounded length. A conservative height bound
+(summed from the domain sizes) is computed as an emergency guard against
+an implementation bug or a future non-finite domain.
 
 **Fail-closed.** Each step also checks monotonicity (`state_leq(head,
 next)`). If the chain ever fails to converge within the bound, or a
