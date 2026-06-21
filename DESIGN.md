@@ -154,6 +154,79 @@ enforces scoping rules that match the executor:
   afterward.
 - Loop: `item_binding` and body-local bindings do not escape.
 
+### Loop fixpoint analysis
+
+A loop may run an unknown number of times — including zero, because the
+collection may be empty. Bounded unrolling (run the body N times and hope
+it settled) is unsound: it can accept a workflow whose taint or automaton
+violation only appears on iteration N+1. Instead the verifier computes a
+**least fixpoint over a finite lattice**, so the result over-approximates
+every possible iteration count.
+
+**Abstract domains.** Verification threads an `AbstractState` — the
+complete set of components that affect later transfer:
+
+- the variable environment, mapping each name to an `AbstractValue`;
+- the possible-state set of every security automaton.
+
+Each `AbstractValue` carries four components, each with its own ordering
+(`x ≤ y` means "x is at least as precise / carries no more guarantees"):
+
+| Component | Meaning | Order | Join |
+|---|---|---|---|
+| `labels` | may-taint labels | subset | union |
+| `provenance` | possible contributing tools | subset | union |
+| `sanitized_for` | sanitizations that hold on **every** path | reverse subset | intersection |
+| `source_tool` | the direct producer | flat (equal, else ⊤) | equal → same, else `<multiple>` |
+
+A missing binding is treated as ⊤ (unusable), so a variable bound on only
+one path does not survive a join. Automaton state-sets grow by subset
+inclusion and join by union.
+
+**Joins.** `join_value` and `join_state` compute the least upper bound
+component-wise using the table above. The joins are idempotent,
+commutative, and associative (verified directly in the tests), which is
+what makes the fixpoint well-defined and order-independent. Conditionals
+reuse the very same `join_state` to merge their two branches.
+
+**The loop equation.** Let `entry` be the pre-loop state and
+`body(H)` the state after analysing the body once, starting from `H` with
+a fresh item binding installed and item / body-local bindings stripped
+afterward. The loop result is the least fixpoint of
+
+    H = entry ⊔ body(H)
+
+Iteration starts from `head = entry` (the zero-iteration path) and repeats
+`head ← entry ⊔ body(head)` until `head` stops changing. Joining with
+`entry` every step is essential: it keeps the empty-collection case live
+and guarantees the chain is ascending. The loop item's abstract value is
+derived from the collection **as it exists on entry**, mirroring the
+executor, which snapshots the collection before iterating — so rebinding
+the collection inside the body cannot change later items.
+
+**Termination.** All universes are finite: taint labels and sanitizer
+names come from the policy, provenance from the finite tool set plus fixed
+pseudo-sources, automaton states from the automaton, the loop-head
+variable set from the program, and `source_tool` lives in a height-2 flat
+lattice. Every non-fixpoint step strictly increases the state in at least
+one of these finite coordinates, so the ascending chain has bounded
+length. A conservative height bound (summed from the domain sizes) is
+computed as an emergency guard against an implementation bug or a future
+non-finite domain.
+
+**Fail-closed.** Each step also checks monotonicity (`state_leq(head,
+next)`). If the chain ever fails to converge within the bound, or a
+transition is non-monotone, the verifier cannot soundly establish loop
+convergence, so it raises a hard violation:
+
+    category="analysis_incomplete", rule_name="loop_fixpoint"
+
+This sets `VerificationResult.ok = False` regardless of `strict` — a
+workflow is **never** accepted when loop convergence is unestablished.
+Because the fixpoint revisits the same body steps, diagnostics are
+deduplicated (violations by `(category, rule_name, step_label, message)`,
+warnings by message) so revisiting cannot inflate or duplicate findings.
+
 ## Hybrid static and runtime
 
 The paper notes that real security is "a series of hoops," drawing

@@ -7,7 +7,7 @@ run() does generate -> verify -> execute in one step.
 from __future__ import annotations
 
 import inspect
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from ..errors import SecurityViolation

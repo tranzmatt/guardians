@@ -401,6 +401,36 @@ def test_loop_body_binding_does_not_leak_across_iterations():
         executor.run(wf)
 
 
+def test_loop_iterates_over_collection_snapshot():
+    """The collection is snapshotted on entry: mutating it in place inside
+    the body does not change which items are iterated."""
+    from guardians.workflow import LoopNode
+    r = ToolRegistry()
+    # grow() appends to the very list it is iterating over.
+    r.register(ToolSpec(name="grow", params=[ParamSpec(name="coll", type="list")]),
+               lambda coll=None: coll.append("x"))
+    p = Policy(name="t", allowed_tools=["grow"])
+    wf = Workflow(goal="t", input_variables=["items"], steps=[
+        WorkflowStep(label="loop", loop=LoopNode(
+            collection_ref="items",
+            item_binding="item",
+            body=[
+                WorkflowStep(label="g", tool_call=ToolCallNode(
+                    tool_name="grow", arguments={"coll": SymRef(ref="items")})),
+            ],
+        )),
+    ])
+    # Budget guards against a regression iterating the growing list forever.
+    executor = WorkflowExecutor(r, p, auto_approve=True, verify_first=False,
+                                budgets={"loop_iter": 50})
+    items = ["a", "b"]
+    executor.env["items"] = items
+    executor.run(wf)
+    # Exactly two iterations despite two appends during the loop.
+    assert len(executor.trace) == 2
+    assert items == ["a", "b", "x", "x"]
+
+
 def test_loop_item_binding_cannot_shadow_outer_variable_at_runtime():
     """A loop whose item_binding shadows an outer variable is rejected."""
     from guardians.workflow import LoopNode

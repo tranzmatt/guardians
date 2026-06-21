@@ -5,7 +5,6 @@ Requires the `llm` extra: pip install guardians[llm]
 
 from __future__ import annotations
 
-import json
 import os
 
 from ..policy import Policy
