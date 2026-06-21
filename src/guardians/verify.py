@@ -19,7 +19,7 @@ import z3
 from .conditions import condition_to_z3, expr_names
 from .policy import Policy, TaintRule
 from .results import VerificationResult, Violation
-from .safe_eval import safe_eval
+from .safe_eval import safe_eval, validate_safe_expr
 from .tools import ToolRegistry, ToolSpec
 from .workflow import Workflow, WorkflowStep, SymRef
 
@@ -1036,10 +1036,16 @@ def _abstract_guard_truth(
 ) -> str:
     """Evaluate a transition guard to TRUE / FALSE / UNKNOWN.
 
-    A guard whose referenced arguments are (recursively) symbolic is
-    UNKNOWN.  A guard that raises during evaluation fails closed: it is a
-    hard ``analysis_incomplete`` violation and is treated conservatively as
-    UNKNOWN (so its transition is still explored).
+    A guard whose referenced arguments are (recursively) symbolic but is
+    otherwise supported is UNKNOWN with no diagnostic.  A guard that is
+    malformed, outside the supported grammar, or otherwise unevaluable fails
+    closed: it raises a hard ``analysis_incomplete`` violation and is treated
+    conservatively as UNKNOWN (so its transition is still explored).
+
+    The grammar is validated *before* the symbolic shortcut: an unsupported
+    guard (e.g. ``x.startswith('a')``) with a symbolic argument must still
+    fail closed, not slip through as a benign UNKNOWN just because we never
+    reached evaluation.
     """
     if not condition:
         return _GUARD_TRUE
@@ -1047,26 +1053,35 @@ def _abstract_guard_truth(
     eval_env: dict[str, Any] = {}
     eval_env.update(resolved)
     eval_env.update(automaton.constants)
-    refs = expr_names(condition)
-    if any(_contains_abstract(eval_env.get(n)) for n in refs):
-        return _GUARD_UNKNOWN
 
+    unevaluable = False
     try:
-        fires = safe_eval(condition, eval_env)
+        validate_safe_expr(condition)
     except Exception:
-        result.add(Violation(
-            category="analysis_incomplete",
-            message=(
-                f"Security automaton '{automaton.name}' guard '{condition}' "
-                f"on tool call '{tool_name}' could not be evaluated; "
-                f"treated conservatively as unknown"
-            ),
-            step_label=step_label,
-            rule_name="automaton_guard",
-        ))
-        return _GUARD_UNKNOWN
+        unevaluable = True
 
-    return _GUARD_TRUE if fires else _GUARD_FALSE
+    if not unevaluable:
+        refs = expr_names(condition)
+        if any(_contains_abstract(eval_env.get(n)) for n in refs):
+            return _GUARD_UNKNOWN
+        try:
+            fires = safe_eval(condition, eval_env)
+            return _GUARD_TRUE if fires else _GUARD_FALSE
+        except Exception:
+            unevaluable = True
+
+    # Malformed / unsupported / unevaluable guard: fail closed.
+    result.add(Violation(
+        category="analysis_incomplete",
+        message=(
+            f"Security automaton '{automaton.name}' guard '{condition}' "
+            f"on tool call '{tool_name}' is not within the supported grammar "
+            f"or could not be evaluated; treated conservatively as unknown"
+        ),
+        step_label=step_label,
+        rule_name="automaton_guard",
+    ))
+    return _GUARD_UNKNOWN
 
 
 # ===================================================================

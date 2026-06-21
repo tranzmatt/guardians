@@ -126,6 +126,31 @@ def test_malformed_guard_rejected_statically():
     assert len(inc) == 1
 
 
+# 5c. A supported-syntax but unsupported guard with a *symbolic* argument
+#     must fail closed statically — the grammar is checked before the
+#     symbolic shortcut, so it cannot slip through as a benign UNKNOWN.
+def test_unsupported_symbolic_guard_rejected_statically():
+    policy = _policy([
+        AutomatonTransition(
+            from_state="q0",
+            to_state="safe",
+            tool_name="go",
+            condition="x.startswith('a')",
+        ),
+    ])
+    result = verify(
+        _call_go({"x": SymRef(ref="x")}, inputs=["x"]),
+        policy,
+        _registry(),
+    )
+    assert not result.ok
+    assert any(
+        v.category == "analysis_incomplete"
+        and v.rule_name == "automaton_guard"
+        for v in result.violations
+    )
+
+
 # 5b. The same guard fails closed at runtime (raises, never silently skips).
 def test_malformed_guard_fails_closed_at_runtime():
     policy = _policy(

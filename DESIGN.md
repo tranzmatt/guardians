@@ -196,11 +196,14 @@ Each `AbstractValue` carries four components, each with its own ordering
 | `source_tools` | possible direct producers | subset | union |
 | `sanitized_for` | sanitizations that hold on **every** path | reverse subset | intersection |
 
-Every component is a set ordered by inclusion, so each is a powerset
-lattice (with the empty set as bottom) — a genuine lattice, not merely a
-join-semilattice. Modelling the direct producer as a *set* (rather than a
-single string with a `<multiple>`/⊤ sentinel) is what makes it a lattice
-and avoids a sentinel that could collide with a real tool name. A missing
+Every component is a set, so each is a powerset lattice — a genuine
+lattice, not merely a join-semilattice. Three (`labels`, `provenance`,
+`source_tools`) are ordered by subset inclusion with `∅` as bottom;
+`sanitized_for` uses the *reverse* order (losing a guarantee moves up, so
+join is intersection), which is the same powerset lattice with its order
+dualised. Modelling the direct producer as a *set* (rather than a single
+string with a `<multiple>`/⊤ sentinel) is what makes it a lattice and
+avoids a sentinel that could collide with a real tool name. A missing
 binding is treated as ⊤ (unusable), so a variable bound on only one path
 does not survive a join. Automaton state-sets grow by subset inclusion and
 join by union.
