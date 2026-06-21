@@ -210,17 +210,35 @@ def _to_z3_list(vals: list) -> list[z3.ExprRef]:
 def expr_names(expr: str) -> set[str]:
     """Extract all variable names referenced in a condition expression.
 
-    Excludes keywords, builtins, and known helper function names
-    (len, domain_of).
+    Excludes keywords and literal constants.  A recognized helper
+    (``len``/``domain_of``) in *call position* is excluded, since it names
+    the function rather than a value; but the same identifier used as a
+    value (``len == 3``) IS a reference and is kept — otherwise a symbolic
+    tool argument named ``len``/``domain_of`` would be invisible to taint,
+    conditional, and automaton analysis.  An *unrecognized* callee (e.g.
+    ``foo`` in ``foo(x)``) is still reported, so scope checking flags the
+    unsupported expression rather than silently accepting it.
     """
     try:
         tree = ast.parse(expr, mode="eval")
     except SyntaxError:
         return set()
     import keyword
+    # Callees of the recognized helper calls — identified by object identity
+    # so only the callee itself (not a same-named value) is dropped.
+    call_funcs = {
+        node.func
+        for node in ast.walk(tree)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in ("len", "domain_of")
+        )
+    }
     return {
         node.id for node in ast.walk(tree)
         if isinstance(node, ast.Name)
+        and node not in call_funcs
         and not keyword.iskeyword(node.id)
-        and node.id not in ("len", "domain_of", "True", "False", "None")
+        and node.id not in ("True", "False", "None")
     }

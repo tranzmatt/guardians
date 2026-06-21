@@ -151,6 +151,44 @@ def test_unsupported_symbolic_guard_rejected_statically():
     )
 
 
+# 5d. An undefined variable hidden behind a symbolic operand must also fail
+#     closed statically (name resolution happens before the symbolic shortcut).
+def test_undefined_variable_in_symbolic_guard_rejected_statically():
+    policy = _policy([
+        AutomatonTransition(
+            from_state="q0",
+            to_state="safe",
+            tool_name="go",
+            condition="x == missing",
+        ),
+    ])
+    result = verify(
+        _call_go({"x": SymRef(ref="x")}, inputs=["x"]),
+        policy,
+        _registry(),
+    )
+    assert not result.ok
+    assert any(
+        v.category == "analysis_incomplete"
+        and v.rule_name == "automaton_guard"
+        for v in result.violations
+    )
+
+
+# 5e. A symbolic tool argument named after a helper (`len`) must not be
+#     erased by the name extractor: the guard is symbolic, so the error
+#     transition is reachable and the workflow is rejected.
+def test_symbolic_len_parameter_guards_error():
+    policy = _policy([
+        AutomatonTransition(from_state="q0", to_state="error",
+                            tool_name="go", condition="len == 'bad'"),
+    ])
+    result = verify(_call_go({"len": SymRef(ref="v")}, inputs=["v"]),
+                    policy, _registry())
+    assert not result.ok
+    assert any(v.category == "automaton" for v in result.violations)
+
+
 # 5b. The same guard fails closed at runtime (raises, never silently skips).
 def test_malformed_guard_fails_closed_at_runtime():
     policy = _policy(

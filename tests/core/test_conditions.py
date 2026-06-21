@@ -32,6 +32,17 @@ def test_expr_names_excludes_keywords():
     assert names == {"x", "y", "z"}
 
 
+def test_expr_names_excludes_helpers_only_in_call_position():
+    """len/domain_of are excluded as callees but kept as value references."""
+    assert expr_names("len(x) > 0") == {"x"}
+    assert expr_names("len == 3") == {"len"}
+    assert expr_names("domain_of(to) in d") == {"to", "d"}
+    assert expr_names("domain_of == 'x'") == {"domain_of"}
+    # An unrecognized callee is still reported (so scope checking can
+    # flag the unsupported expression rather than silently accepting it).
+    assert expr_names("foo(x)") == {"foo", "x"}
+
+
 # --- condition_to_z3 ---
 
 def test_z3_simple_comparison():

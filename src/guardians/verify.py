@@ -1062,21 +1062,30 @@ def _abstract_guard_truth(
 
     if not unevaluable:
         refs = expr_names(condition)
-        if any(_contains_abstract(eval_env.get(n)) for n in refs):
-            return _GUARD_UNKNOWN
-        try:
-            fires = safe_eval(condition, eval_env)
-            return _GUARD_TRUE if fires else _GUARD_FALSE
-        except Exception:
+        # Resolve names *before* the symbolic shortcut: an undefined
+        # variable would raise at runtime, so it must fail closed even when
+        # another operand is symbolic (which would otherwise short-circuit
+        # to a benign UNKNOWN and hide the missing name).
+        if refs.difference(eval_env):
             unevaluable = True
+        elif any(_contains_abstract(eval_env[n]) for n in refs):
+            return _GUARD_UNKNOWN
+        else:
+            try:
+                fires = safe_eval(condition, eval_env)
+                return _GUARD_TRUE if fires else _GUARD_FALSE
+            except Exception:
+                unevaluable = True
 
-    # Malformed / unsupported / unevaluable guard: fail closed.
+    # Malformed / unsupported / undefined-reference / unevaluable guard:
+    # fail closed.
     result.add(Violation(
         category="analysis_incomplete",
         message=(
             f"Security automaton '{automaton.name}' guard '{condition}' "
-            f"on tool call '{tool_name}' is not within the supported grammar "
-            f"or could not be evaluated; treated conservatively as unknown"
+            f"on tool call '{tool_name}' is not within the supported grammar, "
+            f"references an undefined variable, or could not be evaluated; "
+            f"treated conservatively as unknown"
         ),
         step_label=step_label,
         rule_name="automaton_guard",
